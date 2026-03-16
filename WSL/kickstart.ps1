@@ -71,3 +71,4 @@ Start-Sleep -Seconds 2
 
 Write-Host ""
 Write-Host "Done! Start WSL with:  wsl -d $Distro" -ForegroundColor Green
+wsl -d $Distro
