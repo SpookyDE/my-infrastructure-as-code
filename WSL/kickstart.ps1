@@ -1,137 +1,73 @@
 #Requires -RunAsAdministrator
-
 <#
 .SYNOPSIS
-    WSL kickstart script – installs a WSL distro and configures a user.
-.PARAMETER Distro
-    Name of the distro to install (default: Ubuntu)
-.EXAMPLE
-    .\wsl-kickstart.ps1
-    .\wsl-kickstart.ps1 -Distro "Debian"
-#>
+    Create ready-to-use WSL installation.
 
-[CmdletBinding()]
+.PARAMETER Distro
+    Installed distribution (Alias: -d).
+    Standard: Ubuntu-24.04
+    Show available: wsl --list --online
+
+.EXAMPLE
+    .\setup-wsl.ps1 -d Ubuntu-24.04
+
+.EXAMPLE
+    $env:WSL_USER = "max"
+    $env:WSL_PASS = "geheim"
+    .\setup-wsl.ps1 -d Debian
+#>
 param(
-    [string]$Distro = "Ubuntu"
+    [Alias("d")]
+    [string]$Distro = "Ubuntu-24.04"
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Helper functions ───────────────────────────────────────────────────────────
+# --- Credentials from env vars or interactive prompt ---
+$WslUser = if ($env:WSL_USER) { $env:WSL_USER } else { Read-Host "WSL username" }
+$WslPass = if ($env:WSL_PASS) { $env:WSL_PASS } else { Read-Host "WSL password" }
 
-function Write-Step {
-    param([string]$Message)
-    Write-Host "`n[*] $Message" -ForegroundColor Cyan
+if ($WslUser -notmatch '^[a-z_][a-z0-9_-]{0,31}$') {
+    throw "Invalid username '$WslUser' (lowercase letters, digits, _ and - only)"
+}
+if ($WslPass.Length -lt 6) {
+    throw "Password too short (at least 6 characters)"
 }
 
-function Write-Success {
-    param([string]$Message)
-    Write-Host "[+] $Message" -ForegroundColor Green
+# --- Enable WSL feature (one-time, may require reboot) ---
+$feature = Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux"
+if ($feature.State -ne "Enabled") {
+    Write-Host "Enabling WSL feature (reboot may be required) ..."
+    Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux" -NoRestart
+    Enable-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform"            -NoRestart
+    Write-Warning "Please reboot and run this script again after reboot."
+    exit 0
 }
 
-function Write-Fail {
-    param([string]$Message)
-    Write-Host "[!] $Message" -ForegroundColor Red
+# --- WSL2 + Kernel updated ---
+wsl --set-default-version 2 | Out-Null
+wsl --update              | Out-Null
+
+# --- Install distribution if not already installed ---
+$installed = wsl --list --quiet 2>$null
+if ($installed -notcontains $Distro) {
+    Write-Host "Installing $Distro ..."
+    wsl --install -d $Distro --no-launch
 }
 
-# ── Read credentials from environment variables ─────────────────────────────────
+# --- Pass setup script to WSL ---
+# Credentials via env vars, never as args (would be visible in ps aux)
+Write-Host "Configuring user '$WslUser' ..."
+$bashScript = Join-Path $PSScriptRoot "standard_setup.sh"
+$wslPath    = wsl -d $Distro -- wslpath -u ($bashScript -replace "\\", "/")
 
-$Username = $env:WSL_USERNAME
-$Password = $env:WSL_PASSWORD
+wsl -d $Distro -u root -- env WSL_USER="$WslUser" WSL_PASS="$WslPass" bash "$wslPath"
 
-if (-not $Username -or -not $Password) {
-    Write-Fail "WSL_USERNAME or WSL_PASSWORD is not set."
-    Write-Host "  Example: `$env:WSL_USERNAME = 'myuser'; `$env:WSL_PASSWORD = 'secret'"
-    exit 1
-}
+if ($LASTEXITCODE -ne 0) { throw "Bash setup failed (Exit-Code $LASTEXITCODE)" }
 
-# ── Install WSL ───────────────────────────────────────────────────────────
+# --- Restart WSL so wsl.conf (default user) takes effect ---
+wsl --shutdown
+Start-Sleep -Seconds 2
 
-Write-Step "Installing WSL distro: $Distro"
-
-try {
-    wsl --install -d $Distro
-} catch {
-    Write-Fail "WSL installation failed: $_"
-    exit 1
-}
-
-Write-Step "Waiting for WSL initialization (30 s)..."
-Start-Sleep -Seconds 30
-
-# ── Check if distro is running ─────────────────────────────────────────────────
-
-Write-Step "Checking if distro is reachable..."
-$wslCheck = wsl -d $Distro -- bash -c "echo ok" 2>&1
-if ($wslCheck -ne "ok") {
-    Write-Fail "Distro '$Distro' is not reachable. Please check manually."
-    exit 1
-}
-
-# ── Create user ──────────────────────────────────────────────────────────
-
-Write-Step "Creating user '$Username' in WSL..."
-
-# Pass password as variable; never embed it directly in the bash command line
-$linuxCmd = @'
-set -euo pipefail
-
-USERNAME="$1"
-PASSWORD="$2"
-
-if id "$USERNAME" &>/dev/null; then
-    echo "User $USERNAME already exists - skipping useradd."
-else
-    useradd -m -s /bin/bash "$USERNAME"
-fi
-
-echo "$USERNAME:$PASSWORD" | chpasswd
-
-usermod -aG sudo "$USERNAME"
-
-SUDOERS_FILE="/etc/sudoers.d/$USERNAME"
-echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
-chmod 440 "$SUDOERS_FILE"
-
-echo "ok"
-'@
-
-$result = wsl -d $Distro -- bash -c "$linuxCmd" -- "$Username" "$Password" 2>&1
-
-if ($LASTEXITCODE -ne 0 -or $result -notcontains "ok") {
-    Write-Fail "User creation failed:`n$result"
-    exit 1
-}
-
-# ── Set default UID ───────────────────────────────────────────────────────
-
-Write-Step "Setting default user to '$Username'..."
-
-$uid = (wsl -d $Distro -- bash -c "id -u `"$Username`"").Trim()
-
-if ($uid -notmatch '^\d+$') {
-    Write-Fail "Could not retrieve UID: '$uid'"
-    exit 1
-}
-
-$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss"
-
-$distroKey = Get-ChildItem $regPath | Where-Object {
-    (Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue).DistributionName -eq $Distro
-}
-
-if (-not $distroKey) {
-    Write-Fail "Registry key for '$Distro' not found."
-    exit 1
-}
-
-Set-ItemProperty -Path $distroKey.PSPath -Name "DefaultUid" -Value ([int]$uid)
-
-# ── Done ────────────────────────────────────────────────────────────────────
-
-Write-Success "WSL setup completed!"
-Write-Host "  Distro   : $Distro"
-Write-Host "  User     : $Username"
-Write-Host "  UID      : $uid"
-Write-Host "`nStart with: wsl -d $Distro`n"
+Write-Host ""
+Write-Host "Done! Start WSL with:  wsl -d $Distro" -ForegroundColor Green
